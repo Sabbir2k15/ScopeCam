@@ -25,14 +25,8 @@ public class HookMain {
         }
 
         try {
-            Config cfg = Config.load();
-            if (!cfg.enabled) {
-                Log.i(TAG, "ScopeCam is disabled in config, skipping hooks for "
-                        + lpparam.packageName);
-                return;
-            }
-            // Install both engines. Each engine self-detects whether the
-            // target app actually uses its camera API.
+            // Always install hooks. The enabled flag is checked per-frame
+            // in the hook callbacks, so toggling doesn't need a reboot.
             Camera1Hook.init(lpparam);
             Camera2Hook.init(lpparam);
             Log.i(TAG, "ScopeCam hooks installed for " + lpparam.packageName);
