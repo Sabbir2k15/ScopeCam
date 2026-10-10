@@ -1,8 +1,11 @@
 package com.sabbir.scopecam.ui
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -126,6 +129,10 @@ class MainActivity : ComponentActivity() {
             blockOnFail: Boolean
         ): Boolean {
             return try {
+                // Android 11+ requires MANAGE_EXTERNAL_STORAGE for /sdcard/DCIM/
+                if (android.os.Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                    return false
+                }
                 val dir = File("/sdcard/DCIM/ScopeCam")
                 dir.mkdirs()
                 val file = File(dir, "config.json")
@@ -369,6 +376,30 @@ private fun ScopeCamScreen(
                     fontSize = 13.sp,
                     modifier = Modifier.padding(16.dp)
                 )
+            }
+
+            // All-files-access grant button (Android 11+)
+            if (android.os.Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                Button(
+                    onClick = {
+                        try {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:${context.packageName}")
+                            )
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C))
+                ) {
+                    Text("Grant All Files Access (Required)", color = Color.White)
+                }
             }
 
             // Save button
