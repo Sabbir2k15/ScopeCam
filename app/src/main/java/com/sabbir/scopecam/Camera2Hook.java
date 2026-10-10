@@ -1,16 +1,21 @@
 package com.sabbir.scopecam;
 
 import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.ImageWriter;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
+import android.view.Surface;
 
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.Collections;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedHelpers;
@@ -33,6 +38,13 @@ public class Camera2Hook {
     private static final String TAG = "ScopeCam";
     private static volatile boolean installed = false;
     private static final Map<ImageReader, FramePump> pumps = new HashMap<>();
+    // Track YUV ImageReader surfaces so addTarget can redirect them.
+    private static final Set<Surface> yuvReaderSurfaces =
+            Collections.newSetFromMap(new WeakHashMap<Surface, Boolean>());
+    // Virtual surfaces given to the camera instead of the app's reader surface.
+    private static final Map<Surface, Surface> redirectMap = new HashMap<>();
+    private static SurfaceTexture virtualTexture;
+    private static Surface virtualSurface;
 
     public static void init(XC_LoadPackage.LoadPackageParam lpparam) {
         if (installed) {
@@ -64,10 +76,49 @@ public class Camera2Hook {
                                 // Only YUV readers carry video frames.
                                 // JPEG (256) is photo capture - leave it alone.
                                 if (format == ImageFormat.YUV_420_888) {
-                                    startPump(reader, width, height);
+                                    try {
+                                        yuvReaderSurfaces.add(reader.getSurface());
+                                    } catch (Throwable ignored) {
+                                    }
+                                    Log.i(TAG, "Camera2: YUV ImageReader created "
+                                            + width + "x" + height + ", waiting for addTarget");
+                                    // Don't start pump yet - wait for addTarget redirect.
+                                    // The pump starts after we redirect the camera.
                                 }
                             } catch (Throwable t) {
                                 Log.e(TAG, "ImageReader hook error: " + t.getMessage());
+                            }
+                        }
+                    });
+
+            // Hook addTarget to redirect YUV reader surfaces to our virtual surface.
+            // The camera writes to virtual; we pump fake frames to the app's reader.
+            XposedHelpers.findAndHookMethod(
+                    "android.hardware.camera2.CaptureRequest$Builder", cl,
+                    "addTarget", Surface.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Surface target = (Surface) param.args[0];
+                                if (target == null || !yuvReaderSurfaces.contains(target)) {
+                                    return;
+                                }
+                                Config cfg = Config.load();
+                                if (!cfg.enabled) {
+                                    return;
+                                }
+                                Surface vs = getVirtualSurface();
+                                if (vs == null || !vs.isValid()) {
+                                    return;
+                                }
+                                redirectMap.put(target, vs);
+                                param.args[0] = vs;
+                                Log.i(TAG, "Camera2: redirected YUV target to virtual surface");
+                                // Now start pumping fake frames to the app's original surface.
+                                startPumpForSurface(target);
+                            } catch (Throwable t) {
+                                Log.e(TAG, "addTarget hook error: " + t.getMessage());
                             }
                         }
                     });
@@ -97,14 +148,49 @@ public class Camera2Hook {
         }
     }
 
+    private static synchronized Surface getVirtualSurface() {
+        try {
+            if (virtualSurface == null || !virtualSurface.isValid()) {
+                // 640x480 is a safe default; the camera will configure it.
+                virtualTexture = new SurfaceTexture(0);
+                virtualTexture.setDefaultBufferSize(640, 480);
+                virtualSurface = new Surface(virtualTexture);
+            }
+            return virtualSurface;
+        } catch (Throwable t) {
+            Log.e(TAG, "getVirtualSurface failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    // Pump management by Surface (for redirected targets).
+    private static final Map<Surface, FramePump> surfacePumps = new HashMap<>();
+
+    private static synchronized void startPumpForSurface(Surface surface) {
+        try {
+            if (surfacePumps.containsKey(surface)) {
+                return;
+            }
+            // We don't know the exact size here; FramePump will query it
+            // from the first dequeued image. Use 0x0 as placeholder.
+            FramePump pump = new FramePump(surface);
+            surfacePumps.put(surface, pump);
+            pump.start();
+            Log.i(TAG, "Camera2: started surface pump after redirect");
+        } catch (Throwable t) {
+            Log.e(TAG, "startPumpForSurface failed: " + t.getMessage());
+        }
+    }
+
     /**
      * Pumps fake YUV frames into the ImageReader's Surface ~30fps.
      * Each queued image triggers the app's OnImageAvailableListener.
      */
     private static class FramePump {
         private final ImageReader reader;
-        private final int width;
-        private final int height;
+        private final Surface surface;
+        private int width;
+        private int height;
         private final ImageWriter writer;
         private final HandlerThread thread;
         private final Handler handler;
@@ -113,10 +199,23 @@ public class Camera2Hook {
 
         FramePump(ImageReader reader, int width, int height) {
             this.reader = reader;
+            this.surface = null;
             this.width = width;
             this.height = height;
             // 3 buffers is enough for a smooth 30fps pump.
             this.writer = ImageWriter.newInstance(reader.getSurface(), 3);
+            this.thread = new HandlerThread("ScopeCam-Pump");
+            this.thread.start();
+            this.handler = new Handler(thread.getLooper());
+        }
+
+        // For redirected surfaces: size is detected from the first image.
+        FramePump(Surface surface) {
+            this.reader = null;
+            this.surface = surface;
+            this.width = 0;
+            this.height = 0;
+            this.writer = ImageWriter.newInstance(surface, 3);
             this.thread = new HandlerThread("ScopeCam-Pump");
             this.thread.start();
             this.handler = new Handler(thread.getLooper());
@@ -137,7 +236,12 @@ public class Camera2Hook {
             } catch (Throwable ignored) {
             }
             synchronized (Camera2Hook.class) {
-                pumps.remove(reader);
+                if (reader != null) {
+                    pumps.remove(reader);
+                }
+                if (surface != null) {
+                    surfacePumps.remove(surface);
+                }
             }
         }
 
@@ -151,15 +255,22 @@ public class Camera2Hook {
                 try {
                     Config cfg = Config.load();
                     if (cfg.enabled) {
-                        byte[] nv21 = FrameProvider.get().getFrame(width, height);
-                        if (nv21 != null) {
-                            Image image = null;
+                        Image image = null;
+                        try {
+                            image = writer.dequeueInputImage();
+                        } catch (Throwable ignored) {
+                        }
+                        if (image != null) {
                             try {
-                                image = writer.dequeueInputImage();
-                            } catch (Throwable ignored) {
-                            }
-                            if (image != null) {
-                                try {
+                                // Detect size from first image if not known.
+                                if (width <= 0 || height <= 0) {
+                                    width = image.getWidth();
+                                    height = image.getHeight();
+                                    Log.i(TAG, "Camera2: detected surface size "
+                                            + width + "x" + height);
+                                }
+                                byte[] nv21 = FrameProvider.get().getFrame(width, height);
+                                if (nv21 != null) {
                                     writeNv21ToImage(nv21, image);
                                     image.setTimestamp(System.nanoTime());
                                     writer.queueInputImage(image);
@@ -169,12 +280,19 @@ public class Camera2Hook {
                                         Log.i(TAG, "Camera2: pumped " + pumped
                                                 + " frames @" + width + "x" + height);
                                     }
-                                } finally {
-                                    if (image != null) {
-                                        try {
-                                            image.close();
-                                        } catch (Throwable ignored) {
-                                        }
+                                } else {
+                                    // No frame available; close without queuing.
+                                    try {
+                                        image.close();
+                                    } catch (Throwable ignored) {
+                                    }
+                                    image = null;
+                                }
+                            } finally {
+                                if (image != null) {
+                                    try {
+                                        image.close();
+                                    } catch (Throwable ignored) {
                                     }
                                 }
                             }
